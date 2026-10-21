@@ -34,3 +34,6 @@ ping-pong:
 
 使用:
 下载.rar解压放入godot项目中
+注意文件路径more_nodes.gdextension 中的路径需要更改与实际一致
+必须使用Vulkan驱动 项目设置-常规-渲染-渲染设备-驱动-驱动.windows
+
