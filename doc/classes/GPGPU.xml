@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="GPGPU" inherits="Object" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		基于 [RenderingDevice] 的 compute shader 封装，用于创建 [GPUPipeline]。不需要实例化，直接类名调用。
+	</brief_description>
+	<description>
+		自建 worker 线程，主线程只投递任务、连信号，不阻塞。主线程创建共享纹理，worker 引用后直接写入 GPU，结果不用回 CPU 就能渲染。引用计数自动管理，用户不用手动释放 RID。
+
+		[b]注意：[/b]依赖 [RenderingDevice]，在 Compatibility 渲染后端或无头模式下不可用。所有方法必须在主线程调用。
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="create_pipeline" qualifiers="static">
+			<return type="GPUPipeline" />
+			<param index="0" name="shader_paths" type="Variant" />
+			<description>
+				创建一个 [GPUPipeline]。
+
+				[param shader_paths] 支持 [String]、[Array]、[PackedStringArray]：
+				[codeblock]
+				# 单 pass
+				var p1 = GPGPU.create_pipeline("res://shader/erode.glsl")
+
+				# 多 pass（按数组顺序串联）
+				var p2 = GPGPU.create_pipeline([
+				    "res://shader/rain.glsl",
+				    "res://shader/flux.glsl",
+				    "res://shader/erode.glsl",
+				])
+				[/codeblock]
+
+				多 pass 里每个 GLSL 是独立的 compute shader，按顺序执行，中间自动加同步。同名绑定跨 pass 自动共享，用户只需 set_image 一次。
+
+				[b]注意：[/b]路径写错或 GLSL 语法错误不会在这里报，而是在第一次 [method GPUPipeline.submit_task] 时才暴露。
+			</description>
+		</method>
+	</methods>
+	<members>
+	</members>
+</class>

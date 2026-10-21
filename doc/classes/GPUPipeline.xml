@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="GPUPipeline" inherits="RefCounted" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		GPU 计算管线。由 [method GPGPU.create_pipeline] 创建，管理一组 compute shader 的编译、绑定、异步执行和结果读回。
+	</brief_description>
+	<description>
+		一个 [GPUPipeline] 可以串联多个 compute shader（pass），按顺序依次 dispatch，pass 之间自动加同步。同名绑定跨 pass 自动共享，只需要 set 一次。
+
+		[b]计算是异步的。[/b]调用 [method submit_task] 后立即返回，主线程不阻塞。计算完成后触发 [signal task_completed]。
+
+		[b]基本用法：[/b]
+		[codeblock]
+		var pipe = GPGPU.create_pipeline(["rain.glsl", "flow.glsl"])
+		pipe.set_image("state_a", img_a)
+		pipe.set_image("state_b", img_b)
+		pipe.set_pingpong("state_a", "state_b")
+		pipe.set_push_const([0.001, 0.3], 0)  # 给 pass 0 设参数
+		pipe.submit_task()
+		await pipe.task_completed
+		[/codeblock]
+
+		[b]GLSL 约定：[/b]
+		1. 文件开头必须有 [code]#[compute][/code] 和 [code]#version 450[/code]。
+		2. 用 [code]layout(set = N, binding = N)[/code] 声明 image2D / buffer / uniform buffer。
+		3. image2D / buffer 的变量名就是 GDScript 里 set_image / set_storage_buffer 传入的名字。
+		4. shader 里必须自己越界保护，dispatch 的线程数可能超过纹理尺寸。
+		5. layout 里的 [code]format[/code]、[code]set[/code]、[code]binding[/code]、[code]local_size[/code] 由 GDE 自动解析，不用手动设。
+
+		[codeblock lang=glsl]
+		#[compute]
+		#version 450
+		layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+		layout(set = 0, binding = 0, rgba32f) uniform image2D height;
+
+		void main() {
+		    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+		    ivec2 size = imageSize(height);
+		    if (id.x >= size.x || id.y >= size.y) return;
+		    imageStore(height, id, imageLoad(height, id) - 0.01);
+		}
+		[/codeblock]
+
+		[b]注意：[/b]set_image 传入的 [Image] 会被 GPU 修改。连续两次 submit 会以上一次结果作为输入。想从原始数据重跑，必须重新 set_image。
+	</description>
+	<tutorials>
+	</tutorials>
+	<signals>
+		<signal name="task_completed">
+			<description>
+				一次 [method submit_task] 的计算完成时触发，无参数。
+
+				失败也会触发，比如 shader 编译错误、纹理创建失败。GDS 侧无法区分成功和失败，需要看 Godot 日志里的 LOG_E 输出。
+			</description>
+		</signal>
+		<signal name="storage_buffer_ready">
+			<param index="0" name="name" type="String" />
+			<param index="1" name="data" type="Variant" />
+			<description>
+				[method request_storage_buffer] 请求的 buffer 读回完成时触发。
+
+				[param data] 的类型和 set_storage_buffer 时传入的一致：PackedFloat32Array / PackedInt32Array / PackedByteArray。如果 buffer 不存在或 pipeline 已销毁，data 是空 PackedByteArray。
+			</description>
+		</signal>
+	</signals>
+	<methods>
+		<method name="submit_task">
+			<return type="void" />
+			<description>
+				提交计算任务给后台线程，立即返回。完成后触发 [signal task_completed]。
+
+				内部只上传"脏"的 buffer（内容相比上次变化），没变的复用 worker 侧缓存。图片类纹理不需要每次重传（除非你 set_image 换了）。
+
+				[b]背压建议：[/b]实时计算时，主线程 60fps 投递、worker 跟不上会导致任务队列无限增长，显示延迟越来越大。推荐用 [code]await pipe.task_completed[/code] 或 connect 信号后再投下一次，确保队列不积压。
+			</description>
+		</method>
+		<method name="add_pass">
+			<return type="void" />
+			<param index="0" name="shader_path" type="String" />
+			<description>
+				追加一个 pass。[method GPGPU.create_pipeline] 的数组形式内部就是循环调用它。
+
+				加 pass 时立刻解析 GLSL 的 layout，但 SPIR-V 编译推迟到第一次 submit_task。
+			</description>
+		</method>
+		<method name="set_iterations">
+			<return type="void" />
+			<param index="0" name="n" type="int" />
+			<description>
+				设置一次 submit_task 内部循环 dispatch 多少次，上限 500000。
+
+				每轮之间会加 barrier 保证同步。次数太大（超过几万）会导致 worker 构建命令缓冲时内存爆炸，建议多次 submit 而不是一次迭代很多轮。
+			</description>
+		</method>
+		<method name="set_dispatch_groups">
+			<return type="void" />
+			<param index="0" name="g" type="Vector3i" />
+			<param index="1" name="pass_idx" type="int" default="-1" />
+			<description>
+				手动指定工作组数量。
+
+				默认从"第一张可写纹理的尺寸"和 GLSL 的 local_size 自动推算，大部分情况下不用设。
+
+				1. [param pass_idx] = -1：应用到所有 pass。
+				2. [param pass_idx] >= 0：只应用到指定 pass。
+				3. 任一分量 ≤ 0：视为自动模式。
+			</description>
+		</method>
+		<method name="get_pass_count">
+			<return type="int" />
+			<description>
+				返回管线里有几个 pass。
+			</description>
+		</method>
+		<method name="get_pass_shader_path">
+			<return type="String" />
+			<param index="0" name="pass_idx" type="int" />
+			<description>
+				返回第 [param pass_idx] 个 pass 的 shader 路径。越界返回空字符串。
+			</description>
+		</method>
+		<method name="get_all_shader_paths">
+			<return type="PackedStringArray" />
+			<description>
+				返回所有 pass 的 shader 路径，按 pass 顺序。
+			</description>
+		</method>
+
+		<method name="set_image">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<param index="1" name="data" type="Variant" />
+			<description>
+				绑定一张纹理。[param name] 必须和 GLSL 里 [code]uniform image2D[/code] 的变量名一致。
+
+				[param data] 支持两种：
+				1. [Image]：GDE 在主设备创建纹理，第一次 submit 时把内容传到 GPU。
+				2. [Texture2D]：直接借用其底层 GPU 纹理，GDE 不接管所有权。
+
+				格式必须和 GLSL 里写的 format 一致。比如 [code]rgba32f[/code] 对应 [code]Image.FORMAT_RGBAF[/code]，[code]r32f[/code] 对应 [code]Image.FORMAT_RF[/code]。
+
+				[b]注意：[/b]传入的 Image 会被 GPU 写入覆盖。要保留原始数据，先复制一份。
+			</description>
+		</method>
+		<method name="get_image">
+			<return type="Image" />
+			<param index="0" name="name" type="String" />
+			<description>
+				从 GPU 读回纹理的最新内容。
+
+				[b]这是同步操作，会短暂阻塞主线程[/b]（几毫秒到几十毫秒，看分辨率），适合用户主动调用（比如存档、导出），不适合每帧调用。每帧读回请用 [method get_latest_t2drd]。
+
+				如果上次 submit 之后还没读过、且这张纹理在任一 pass 里可写，会从 GPU 读；否则返回上次的 CPU 缓存。
+			</description>
+		</method>
+		<method name="get_latest_t2drd">
+			<return type="Texture2DRD" />
+			<param index="0" name="name" type="String" />
+			<description>
+				返回纹理最新的 [Texture2DRD]（零拷贝，直接给 material 采样用）。
+
+				1. 如果 [param name] 是 pingpong 的一端，自动判断最新在哪张（a 还是 b），返回那一张。
+				2. 如果不是 pingpong，返回纹理本身。
+
+				可以每帧调，零开销。适合把 GPU 计算结果直接贴到材质上。
+			</description>
+		</method>
+
+		<method name="get_texture_rid">
+			<return type="RID" />
+			<param index="0" name="name" type="String" />
+			<description>
+				返回该纹理在主设备上的 RID，用于跨管线传递。
+
+				[codeblock]
+				var rid = pipe1.get_texture_rid("height")
+				pipe2.set_texture_rid("height_in", rid)
+				[/codeblock]
+
+				[b]注意：[/b]返回值本身不加引用计数，拿到后要立刻传给其他管线，中间别做耗时操作，否则原 pipeline 可能已经释放了。
+			</description>
+		</method>
+		<method name="set_texture_rid">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<param index="1" name="rid" type="RID" />
+			<description>
+				把一个已注册的 RID 绑定到本管线的 GLSL 变量名上，实现跨管线共享纹理，不需要 CPU 拷贝。
+
+				RID 必须来自另一个 [GPUPipeline] 的 [method get_texture_rid]，或 set_image 传 [Texture2D] 时内部注册过的 RID。[b]裸 RID 会被拒绝[/b]（缺少 format / 宽高信息）。
+
+				内部自动加一份引用，所有持有者都释放后纹理才真正回收。
+			</description>
+		</method>
+
+		<method name="set_storage_buffer">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<param index="1" name="data" type="Variant" />
+			<description>
+				绑定 storage buffer。[param name] 必须和 GLSL 里 [code]buffer XXX { ... }[/code] 的实例名一致（没写实例名则用块名）。
+
+				[param data] 支持 PackedFloat32Array / PackedInt32Array / PackedByteArray。
+
+				内部会对比上次内容，相同就跳过上传。用户不需要手动标脏。
+			</description>
+		</method>
+		<method name="request_storage_buffer">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<description>
+				请求从 GPU 读回 storage buffer 的最新内容，结果通过 [signal storage_buffer_ready] 异步返回。
+
+				buffer 是 worker 侧本地创建的，主设备不认识它的 RID，所以要单独投递一个读回任务。
+
+				[b]注意：[/b]完成后触发的是 [signal storage_buffer_ready]，[b]不是[/b] [signal task_completed]。想等数据要 await storage_buffer_ready，别 await task_completed，否则会死等。
+
+				[b]性能：[/b]读回在 worker 侧同步执行（[code]buffer_get_data[/code]），大 buffer（几 MB）会让 worker 卡住几毫秒。低频调用没问题，别每帧调。
+			</description>
+		</method>
+
+		<method name="set_uniform_buffer">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<param index="1" name="data" type="Variant" />
+			<description>
+				绑定 uniform buffer。[param data] 支持 [Array] 和 [PackedByteArray]。
+
+				[Array] 路径下，每个元素按 GLSL 字段顺序填值，std140 对齐由 GDE 自动处理。字段类型和顺序必须和 GLSL 声明匹配。
+
+				内容没变时会跳过重传。
+			</description>
+		</method>
+		<method name="set_push_const">
+			<return type="void" />
+			<param index="0" name="data" type="Variant" />
+			<param index="1" name="pass_idx" type="int" default="0" />
+			<description>
+				设置某个 pass 的 push_constant。
+
+				[param data] 支持 [Array] / PackedFloat32Array / PackedInt32Array / [Vector2] / [Vector3] / [Vector4] / 单个 [int] / [float] / [bool]。也支持直接传 [PackedByteArray]（大小必须匹配）。
+
+				值的数量和类型必须和 GLSL 里 push_constant 块的字段一一对应。std430 对齐由 GDE 自动处理。
+
+				每个 pass 有独立的 push_constant，[param pass_idx] 指定给哪个 pass 设，默认第 0 个。
+			</description>
+		</method>
+		<method name="set_spec_const">
+			<return type="void" />
+			<param index="0" name="id" type="int" />
+			<param index="1" name="value" type="Variant" />
+			<param index="2" name="pass_idx" type="int" default="0" />
+			<description>
+				设置某个 pass 的特化常量。
+
+				[param id] 是 GLSL 里 [code]layout(constant_id = N)[/code] 的 N。[param value] 只支持 [int] / [float] / [bool]。
+
+				值变了会触发该 pass 的 pipeline 重建（有开销），值不变时跳过。
+			</description>
+		</method>
+
+		<method name="set_pingpong">
+			<return type="void" />
+			<param index="0" name="a_name" type="String" />
+			<param index="1" name="b_name" type="String" />
+			<description>
+				声明一对 pingpong 双缓冲。
+
+				compute shader 不能对同一张纹理原地读写。每轮必须"读 a 写 b"，下一轮"读 b 写 a"，两张交替。这个函数声明了这对关系，之后每次 submit 时自动翻转。
+
+				[b]用法：[/b]
+				[codeblock]
+				pipe.set_image("state_a", img_a)
+				pipe.set_image("state_b", img_b)
+				pipe.set_pingpong("state_a", "state_b")
+				[/codeblock]
+
+				[b]实现原理：[/b]worker 内部维护每对的"写入计数"，每有一个 pass 写这个 pair 就 +1。pass 执行前按奇偶选择预先构建好的 uniform_set（flip=0 或 flip=1）。
+
+				[b]重要限制 1：[/b]两端都必须 [method set_image] 绑定，只绑一边的 pair 会被跳过并打警告。
+
+				[b]重要限制 2：[/b]所有 pass 涉及同一对 pingpong 时，写集合必须一致。比如 pass 1 写 state 也写 velocity，pass 2 只写 state 不写 velocity，那 velocity 的 flip 计数会落后，后续 pass 绑错纹理，结果错误但不报错。
+
+				[b]透传：[/b]不需要某个纹理的 pass 也必须原样写回去。比如 rain pass 不改 velocity，也要：
+				[codeblock lang=glsl]
+				vec4 v = imageLoad(velocity_input, id);
+				imageStore(velocity_output, id, v);
+				[/codeblock]
+			</description>
+		</method>
+		<method name="get_pingpong_output">
+			<return type="Variant" />
+			<param index="0" name="name" type="String" />
+			<description>
+				返回 pingpong 对的结果 [Image]。根据迭代次数奇偶自动判断最新在 a 还是 b，内部走 [method get_image] 从 GPU 读回。
+
+				[b]同步操作，会阻塞主线程[/b]，和 get_image 一样，适合调试/导出，不适合每帧调用。
+
+				传入的名字不在任何 pingpong 对里时返回空 Variant。
+			</description>
+		</method>
+
+		<method name="link">
+			<return type="void" />
+			<param index="0" name="pass_a" type="int" />
+			<param index="1" name="name_a" type="String" />
+			<param index="2" name="pass_b" type="int" />
+			<param index="3" name="name_b" type="String" />
+			<description>
+				让两个 pass 里不同名字的 binding 指向同一张纹理。
+
+				同名跨 pass 本来就自动共享，link 用于"两个 pass 用了不同名字，但语义上是同一张图"的场景。
+
+				[codeblock]
+				# pass 0 叫 "height"，pass 3 叫 "state"
+				pipe.link(0, "height", 3, "state")
+				pipe.set_image("height", img)  # 只 set 一个名字即可
+				[/codeblock]
+
+				1. 支持 image2D / storage buffer / uniform buffer，两端类型必须一致。
+				2. 别名和真名任意一个 set 都会生效（内部先看原名有没有绑，再看 link 的另一边有没有绑）。
+				3. 如果两边都 set 了不同内容，link 不生效，各自用自己的绑定（会打警告）。
+				4. 一个名字只能 link 一个对方，不支持 a→b→c 链式。
+			</description>
+		</method>
+
+		<method name="create_display">
+			<return type="void" />
+			<param index="0" name="source_name" type="String" />
+			<param index="1" name="width" type="int" />
+			<param index="2" name="height" type="int" />
+			<description>
+				对指定 pingpong 对启用三缓冲显示池。
+
+				解决"worker 一边写、主线程一边读同一张纹理"导致的显示闪烁。内部建 3 张纹理，worker 每次 compute 完成后把结果 copy 到其中一张，主线程收到 show_idx 后切 [method get_display_texture] 返回的稳定 Texture2DRD。
+
+				[param source_name] 必须是已 set_pingpong 的一端（a 或 b），[param width] / [param height] 要和源纹理尺寸一致。
+
+				[b]注意：[/b]创建后不会立刻有内容。要 submit 至少 3 次把三张 display 填满，show_idx 才从 -1 变成有效值。简单做法：
+				[codeblock]
+				pipe.create_display("state_a", 512, 512)
+				await pipe.task_completed
+				for i in 3:
+				    pipe.submit_task()
+				    await pipe.task_completed
+				[/codeblock]
+
+				只支持 2D 纹理，只支持一个 pipeline 一次。
+			</description>
+		</method>
+		<method name="get_display_texture">
+			<return type="Texture2DRD" />
+			<description>
+				返回 create_display 创建的稳定 [Texture2DRD]。
+
+				内部 RID 会自动切换（显示哪张由 worker 回传的 show_idx 决定），但对象本身不变，所以可以只在初始化时 set_shader_parameter 一次，之后不用管。
+
+				[codeblock]
+				pipe.create_display("state_a", 512, 512)
+				await pipe.task_completed
+				mat.set_shader_parameter("height_tex", pipe.get_display_texture())
+				# 之后永远不用再 set
+				[/codeblock]
+
+				没调 create_display 时返回空。
+			</description>
+		</method>
+
+		<method name="generate_bindings_code">
+			<return type="String" />
+			<description>
+				扫描第一个 pass 的 GLSL 绑定，生成一段 GDScript 绑定模板。
+
+				适合拿到新 shader 时快速生成对应的 set_xxx 调用。返回字符串，不会自动执行。
+
+				只扫 pass 0，多 pass 管线里其他 pass 独有的绑定不会出现在模板里。
+			</description>
+		</method>
+
+		<method name="mark_dirty_storage_buffer">
+			<return type="void" />
+			<param index="0" name="name" type="String" />
+			<description>
+				手动标脏 storage buffer，强制下一次 submit 重传内容。
+
+				普通用户不需要——set_storage_buffer 已经自动对比内容并标脏。这个接口留给"直接修改了内部数据、需要强制重传"的场景。
+			</description>
+		</method>
+		<method name="mark_dirty_uniform_buffer">
+			<return type="void" />
+			<param name="name" type="String" />
+			<description>
+				手动标脏 uniform buffer，用法和 [method mark_dirty_storage_buffer] 一样。
+			</description>
+		</method>
+	</methods>
+	<members>
+	</members>
+</class>
